@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+        <key>local_name</key>
+        <string>cluster_node_1</string>
+	<key>local_address</key>
+        <string>127.0.0.1</string>
+	<key>local_netmask</key>
+        <string>255.255.255.0</string>
+        <key>local_port</key>
+        <integer>0x1800</integer>
+        <key>nodes</key>
+	<array>
+	  <dict>
+	    <key>name</key>
+            <string>cluster_node_2</string>
+            <key>address</key>
+            <string>127.0.0.2</string>
+	    <key>netmask</key>
+            <string>255.255.255.0</string>
+          </dict>
+	</array>
+</dict>
+</plist>

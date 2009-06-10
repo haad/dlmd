@@ -1,0 +1,266 @@
+
+#include <sys/param.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+#include <err.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <prop/proplib.h>
+
+#include "dlmd.h"
+
+extern dlmd_node_t *local_node;
+
+struct dlmd_listn_conf {
+	int listn_sock;
+	struct sockaddr_in listn_addr;
+	socklen_t listn_addr_len;
+};
+
+/*
+ * This file will contain all routines used in listener thread.
+ */
+
+#define MAX_BUF_SIZE 1024
+
+static int listener_buf_parse(const char *, size_t);
+/* message parsing routines */
+static int listener_keepalive_msg(prop_dictionary_t);
+static int listener_request_msg(prop_dictionary_t);
+static int listener_reply_msg(prop_dictionary_t);
+static int listener_lock_msg(prop_dictionary_t);
+static int listener_unlock_msg(prop_dictionary_t);
+
+struct msg_function {
+	const char *cmd;
+	int  (*fn)(prop_dictionary_t);
+};
+
+struct msg_function msg_fn[] = {
+	{MSG_KEEPALIVE_TYPE, listener_keepalive_msg},
+	{MSG_LOCK_REQUEST_TYPE, listener_request_msg},
+	{MSG_LOCK_REPLY_TYPE, listener_reply_msg},
+	{MSG_LOCK_TYPE, listener_lock_msg},
+	{MSG_UNLOCK_TYPE, listener_unlock_msg},	
+	{NULL, NULL}
+};
+
+
+void *
+listener_start(void *arg)
+{
+	char buf[MAX_BUF_SIZE];
+	dlmd_conf_t *conf = (dlmd_conf_t *)arg;
+	struct dlmd_listn_conf listn;
+	
+	while(1) {
+		if((recvfrom(conf->socket, buf, MAX_BUF_SIZE, 0, (struct sockaddr *)&listn.listn_addr,
+			    &listn.listn_addr_len)) == -1)
+			DPRINTF(("recvfrom failed."));
+		
+		/*DPRINTF(("DLMD received packet from IP: %s, port %d\n", inet_ntoa(listn.listn_addr.sin_addr),
+			  ntohs(listn.listn_addr.sin_port)));*/
+
+		/* Extra insurance. */
+		buf[MAX_BUF_SIZE - 1] = '\0';
+			
+		listener_buf_parse(buf, MAX_BUF_SIZE);
+
+		memset(buf, '\0', MAX_BUF_SIZE); 
+	}
+	
+	return NULL;
+}
+
+static int
+listener_buf_parse(const char *buf, size_t buf_len)
+{
+	prop_dictionary_t dict;
+	const char *msg_type, *name;
+	int r, i;
+	size_t len, slen;
+	
+	r = -1;
+	
+	if ((dict = prop_dictionary_internalize(buf)) == NULL)
+		return -1;
+
+	prop_dictionary_get_cstring_nocopy(dict, MSG_TYPE, &msg_type);
+	prop_dictionary_get_cstring_nocopy(dict, MSG_NODE_NAME, &name);
+
+	DPRINTF(("Received %s message from %s node.\n", msg_type, name));
+	//DPRINTF	(("Message is %s\n", buf));
+
+	len = strlen(msg_type);
+	
+	for(i = 0; msg_fn[i].cmd != NULL; i++){
+		slen = strlen(msg_fn[i].cmd);
+
+		if (len != slen)
+			continue;
+
+		if ((strncmp(msg_type, msg_fn[i].cmd, slen)) == 0) {
+			r = msg_fn[i].fn(dict);
+			break;
+		}
+	}
+
+	return r;
+}
+
+static int
+listener_keepalive_msg(prop_dictionary_t dict)
+{
+	dlmd_node_t *node;
+	const char *name;
+
+	prop_dictionary_get_cstring_nocopy(dict, MSG_NODE_NAME, &name);
+
+	/* Get locked node */
+	if ((node = dlmd_node_find(0, name)) == NULL)
+	    return -1;
+
+/*	DPRINTF(("GET node %s setting alive_flag = %d\n", name, node->alive_flag));
+
+#ifdef DLMD_DEBUG
+	if (node->alive_flag == -1)
+		printf("node %s was disabled\n", name);
+	else
+		printf("node %s is enabled\n", name);
+#endif	
+*/
+	/* Set alive flag to default value */
+	node->alive_flag = MAX_ALIVE_CHECKS;
+
+	dlmd_node_unbusy(node);
+	
+	return 0;
+}
+
+static int
+listener_request_msg(prop_dictionary_t dict)
+{
+	dlmd_node_t *node;
+	dlmd_lock_t *lock;
+	const char *name, *resource;
+	uint64_t event;
+	uint32_t mode;
+	uint32_t id;
+	char *buf;
+	
+	prop_dictionary_get_cstring_nocopy(dict, MSG_NODE_NAME, &name);
+	prop_dictionary_get_cstring_nocopy(dict, MSG_RESOURCE, &resource);
+
+	prop_dictionary_get_uint64(dict, MSG_EVENT, &event);
+	prop_dictionary_get_uint32(dict, MSG_LOCK_TYPE, &mode);
+	prop_dictionary_get_uint32(dict, MSG_ID, &id);
+			
+	/* Get locked node */
+	if ((node = dlmd_node_find(0, name)) == NULL)
+	    return -1;
+	
+	DPRINTF(("Get locking request message lock %s - %d - %s\n", resource, mode, node->node_name));
+	//DUMP_DICT(dict, buf);
+	
+	lock = dlmd_lock_add(resource, mode, event, id, DLMD_LOCK_REMOTE);
+
+	/* compare received Lamport logical timestamp with local one,
+	   if received is > then I have to swap them. I also have to
+	   increment event_counter before return. */
+	event = dlmd_event_cnt_cas(event);
+
+	/* Insert node into the lock node queue */
+	SLIST_INSERT_HEAD(&lock->nodes, node, lock_next);
+
+	/* insert lock into the queue */
+	lock = dlmd_lock_insert_request(lock);
+
+	buf = reply_msg_init(local_node->node_name, resource, event, lock->flags);
+	//printf("%s \n", buf);
+	
+	DPRINTF(("Sending reply message to node %s for resource %s with timestamp %"PRIu64"\n", name, resource, event));
+	/* Send reply message back to requester */
+	/* XXX I can't sent reply back if I have request in my queue
+	   for the same resource before this entry */
+	dlmd_node_unicast_msg(node, buf, strlen(buf));
+
+	free(buf);
+	
+	return 0;
+}
+
+/*
+ * Listen for a reply message.
+ */
+static int
+listener_reply_msg(prop_dictionary_t dict)
+{
+	dlmd_lock_t *lock;
+	const char *name, *resource;
+	uint64_t event;
+	uint32_t flags, type;
+
+	prop_dictionary_get_cstring_nocopy(dict, MSG_NODE_NAME, &name);
+	prop_dictionary_get_cstring_nocopy(dict, MSG_RESOURCE, &resource);
+	prop_dictionary_get_uint64(dict, MSG_EVENT, &event);
+	prop_dictionary_get_uint32(dict, MSG_LOCK_TYPE, &flags);
+
+	type = DLMD_LOCK_LOCAL;
+
+	DPRINTF(("Get reply message from %s for %s timestamp %"PRIu64"\n", name, resource, event));
+
+	/* Do I need to change event_counter after receiving reply msg ?*/
+	dlmd_event_cnt_inc();
+
+	/* XXX LKM_CRMODE == 2 */
+	if (flags == 2)
+		type |= DLMD_LOCK_CR;
+	
+	if ((lock = dlmd_lock_find(resource, 0, type)) != NULL)
+		dlmd_lock_signal(lock);
+	else 
+		assert("Received reply message for non existing lock\n");
+	
+	return 0;
+}
+
+static int
+listener_lock_msg(prop_dictionary_t dict)
+{
+	return 0;
+}
+
+static int
+listener_unlock_msg(prop_dictionary_t dict)
+{
+	dlmd_lock_t *lock;
+	dlmd_node_t *node;
+	const char *name, *resource;
+	uint64_t event;
+
+	prop_dictionary_get_cstring_nocopy(dict, MSG_NODE_NAME, &name);
+	prop_dictionary_get_cstring_nocopy(dict, MSG_RESOURCE, &resource);
+	prop_dictionary_get_uint64(dict, MSG_EVENT, &event);
+
+	/* Get locked node */
+	if ((node = dlmd_node_find(0, name)) == NULL)
+	    return -1;
+
+	DPRINTF(("Get unlock message from %s for %s timestamp %"PRIu64"\n", name, resource, event));
+	
+	/* Do I need to change event_counter after receiving reply msg ?*/
+	dlmd_event_cnt_inc();
+	
+	if ((lock = dlmd_lock_find(resource, 0, DLMD_LOCK_REMOTE)) != NULL)
+		dlmd_lock_release(lock->lock_id, DLMD_LOCK_REMOTE, node);
+		
+	return 0;
+}
